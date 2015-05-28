@@ -19,3 +19,10 @@ Example usage:
 The --subnets argument summarizes the clients into /24 (IPv4) and /64 (IPv6) subnets. 
 
 This program shows the top 10 sources every minute, and every second shows a line with: "p" - packets, "c" - clients (really unique source IPs or Subnets), and "a" - average packets per unique source IP
+
+Defaults:
+
+ * interface = eth0
+ * filter = port 123 and udp
+
+--ipv4 and --ipv6 options change the filter to remove the reply traffic from the report
