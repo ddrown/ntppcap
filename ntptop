@@ -2,7 +2,7 @@
 
 use strict;
 use Getopt::Long;
-use Net::Pcap qw(:functions);
+use Net::Pcap;
 use NetPacket::Ethernet qw(:types);
 use NetPacket::IP       qw(:protos);
 use NetPacket::IPv6;
@@ -130,12 +130,11 @@ if($src_ipv6) {
   $pcap_filter .= " and not src $src_ipv6";
 }
 my($err);
-my $pcap = pcap_open_live($net_interface, 256, 0, 10, \$err)
+my $pcap = Net::Pcap::pcap_open_live($net_interface, 256, 0, 10, \$err)
         or die "fatal: can't open network device $net_interface: $err (do you have the privileges?)\n";
 my($filter);
-pcap_compile($pcap, \$filter, $pcap_filter, 1, 0) == 0 or die "fatal: filter error\n";
-pcap_setfilter($pcap, $filter);
+Net::Pcap::pcap_compile($pcap, \$filter, $pcap_filter, 1, 0) == 0 or die "fatal: filter error\n";
+Net::Pcap::pcap_setfilter($pcap, $filter);
 
-pcap_loop($pcap, -1, \&process_packet, '');
-pcap_close($pcap);
-
+Net::Pcap::pcap_loop($pcap, -1, \&process_packet, '');
+Net::Pcap::pcap_close($pcap);
