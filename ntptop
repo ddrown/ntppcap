@@ -7,6 +7,32 @@ use NetPacket::Ethernet qw(:types);
 use NetPacket::IP       qw(:protos);
 use NetPacket::IPv6;
 use NetPacket::UDP;
+use Net::Patricia;
+
+my(%names);
+sub lookup_asn_name {
+  my($asn) = @_;
+
+  if($asn =~ /[^0-9]/) {
+    die("invalid asn $asn");
+  }
+
+  if(defined($names{$asn})) {
+    return $names{$asn};
+  }
+
+# TODO: this should use a library rather than a subprocess
+  open(DIG,"-|", "dig +short AS$asn.asn.cymru.com TXT") or die("open dig failed: $!");
+  my $name = <DIG>;
+  close(DIG);
+  
+  chomp($name);
+  $name =~ s/^"//;
+  $name =~ s/"$//;
+  $names{$asn} = $name;
+
+  return $name;
+}
 
 # Configuration
 my $net_interface = "eth0";
@@ -14,6 +40,7 @@ my $pcap_filter = "port 123 and udp";
 my $src_ipv4 = "";
 my $src_ipv6 = "";
 my $subnet_report = 0;
+my $asn_index_file;
 my $help = 0;
 GetOptions (
     "interface=s" => \$net_interface,
@@ -21,6 +48,7 @@ GetOptions (
     "ipv4=s"      => \$src_ipv4,
     "ipv6=s"      => \$src_ipv6,
     "subnets"     => \$subnet_report,
+    "asns=s"      => \$asn_index_file,
     "help"        => \$help
 ) or die("Error in command line arguments\n");
 # end Configuration
@@ -32,31 +60,79 @@ if($help) {
   print "  --ipv4=x.x.x.x                     -- ipv4 source address to filter out (local address)\n";
   print "  --ipv6=x::x                        -- ipv6 source address to filter out (local address)\n";
   print "  --subnets                          -- give a subnet report\n";
+  print "  --asns=file                        -- load subnet to ASN index from file\n";
   print "  --help                             -- this message\n";
   exit(1);
+}
+
+my $subnet_to_asn;
+if(defined($asn_index_file)) {
+  $subnet_to_asn = new Net::Patricia;
+
+  print "loading asn/subnet file ...\n";
+  my $line = 0;
+  if($asn_index_file =~ /\.bz2$/) {
+    open(SUBNETS, "-|", "bzcat $asn_index_file") or die "cannot open bzcat $asn_index_file: $!";
+  } else {
+    open(SUBNETS, "<", $asn_index_file) or die "cannot open $asn_index_file: $!";
+  }
+  while (<SUBNETS>) {
+    $line++;
+    s/#.*//;
+    chomp($_);
+    if(length($_)) {
+      eval {
+	chomp($_);
+	my($subnet,$asn) = split(/ /);
+	$subnet_to_asn->add_string($subnet,$asn);
+      };
+      if($@) {
+	die("error with asn/subnet file line $line: $@");
+      }
+    }
+  }
+  close(SUBNETS);
+  print "asn/subnet file load done\n";
 }
 
 my(%clients,$packets);
 
 my($last,$client_ts);
+my($last_pkt, $last_clients);
 sub report {
   my $now = time();
   if($now != $last) {
     $last = $now;
     my($clientcount) = scalar(keys %clients);
-    printf("p:%d c:%d a:%0.1f\n",$packets, $clientcount, ($packets/$clientcount));
+    if(defined($last_pkt)) {
+      printf("p:%d(+%d) c:%d(+%d) a:%0.1f\n", $packets, $packets-$last_pkt, $clientcount, $clientcount-$last_clients, ($packets/$clientcount));
+    } else {
+      printf("p:%d c:%d a:%0.1f\n",$packets, $clientcount, ($packets/$clientcount));
+    }
+    $last_pkt = $packets;
+    $last_clients = $clientcount;
     if($now-$client_ts > 60) { # every 60 seconds, give a report
       my(@top) = sort { $clients{$b} <=> $clients{$a} } keys %clients;
       my $pos = 0;
       for(my $i = 0; $i < 10 and $i < @top and $clients{$top[$i]} > 5; $i++) {
 	my $client = $top[$i];
-	my $msg = "[$client]:$clients{$client} ";
-	if($pos + length($msg) > 80) {
-	  print "\n";
-	  $pos = 0;
+        if(defined($subnet_to_asn)) {
+          my $pct = int($clients{$client} / $packets * 100);
+          if($client =~ /^[0-9]+$/) {
+            my $asn_name = lookup_asn_name($client);
+            print "AS$client ($asn_name):$clients{$client} $pct%\n";
+          } else {
+	    print "[$client]:$clients{$client} $pct%\n";
+	  }
+        } else {
+	  my $msg = "[$client]:$clients{$client} ";
+	  if($pos + length($msg) > 80) {
+	    print "\n";
+	    $pos = 0;
+	  }
+	  print $msg;
+	  $pos += length($msg);
 	}
-	print $msg;
-	$pos += length($msg);
       }
       if($pos > 0) {
 	print "\n";
@@ -65,6 +141,8 @@ sub report {
 
       %clients = (); # clear clients every minute
       $packets = 0;
+      $last_pkt = undef;
+      $last_clients = undef;
     }
   }
 }
@@ -92,10 +170,19 @@ sub process_packet {
       $proto = $ipframe->{proto};
     }
 
-    if($subnet_report) {
-      $src_ip =~ s/\.[0-9]+$/./; # summarize on /24's
+    if($subnet_to_asn) {
+      my $asn = $subnet_to_asn->match_string($src_ip);
+      if(length($asn)) {
+        $clients{$asn}++;
+      } else {
+        $clients{$src_ip}++;
+      }
+    } else {
+      if($subnet_report) {
+        $src_ip =~ s/\.[0-9]+$/./; # summarize on /24's
+      } 
+      $clients{$src_ip}++;
     }
-    $clients{$src_ip}++;
     $packets++;
   } elsif($ethframe->{type} == ETH_TYPE_IPv6) {
     # decode the IP payload
@@ -113,10 +200,20 @@ sub process_packet {
       $proto = $ipframe->{next_header};
     }
 
-    if($subnet_report) {
-      $src_ip = $ipframe->subnet_64();
-    }
-    $clients{$src_ip}++;
+# TODO: need a second tree for IPv6
+#    if($subnet_to_asn) {
+#      my $asn = $subnet_to_asn->match_string($src_ip);
+#      if(length($asn)) {
+#        $clients{$asn}++;
+#      } else {
+#        $clients{$src_ip}++;
+#      }
+#    } else {
+      if($subnet_report) {
+	$src_ip = $ipframe->subnet_64();
+      }
+      $clients{$src_ip}++;
+#    }
     $packets++;
   }
 
