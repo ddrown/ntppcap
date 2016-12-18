@@ -1,0 +1,100 @@
+#!/usr/bin/perl
+
+# Requires Net::Patricia perl module
+# example commandline: ./ip-to-asn --asns=asn.subnet-index.2016.12.15.bz2 <ntp-clients.ips | tee ntp-clients.asns
+
+use strict;
+use Getopt::Long;
+use Net::Patricia;
+
+my(%names);
+sub lookup_asn_name {
+  my($asn) = @_;
+
+  if($asn =~ /[^0-9]/) {
+    die("invalid asn $asn");
+  }
+
+  if(defined($names{$asn})) {
+    return $names{$asn};
+  }
+
+# TODO: this should use a library rather than a subprocess
+  open(DIG,"-|", "dig +short AS$asn.asn.cymru.com TXT") or die("open dig failed: $!");
+  my $name = <DIG>;
+  close(DIG);
+  
+  chomp($name);
+  $name =~ s/^"//;
+  $name =~ s/"$//;
+  $names{$asn} = $name;
+
+  return $name;
+}
+
+my $asn_index_file;
+GetOptions (
+    "asns=s"      => \$asn_index_file,
+) or die("Error in command line arguments\n");
+
+# turn off buffering
+$| = 1;
+
+if(not defined($asn_index_file)) {
+  die("I need --asns=file");
+}
+
+my $subnet_to_asn = new Net::Patricia;
+
+print "loading asn/subnet file ...\n";
+my $line = 0;
+if($asn_index_file =~ /\.bz2$/) {
+  open(SUBNETS, "-|", "bzcat $asn_index_file") or die "cannot open bzcat $asn_index_file: $!";
+} else {
+  open(SUBNETS, "<", $asn_index_file) or die "cannot open $asn_index_file: $!";
+}
+while (<SUBNETS>) {
+  $line++;
+  s/#.*//;
+  chomp($_);
+  if(length($_)) {
+    eval {
+      chomp($_);
+      my($subnet,$asn) = split(/ /);
+      $subnet_to_asn->add_string($subnet,$asn);
+    };
+    if($@) {
+      die("error with asn/subnet file line $line: $@");
+    }
+  }
+}
+close(SUBNETS);
+print "asn/subnet file load done\n";
+
+my(%clients);
+my($total) = 0;
+while(<>) {
+  chomp($_);
+  eval {
+    my $asn = $subnet_to_asn->match_string($_);
+    if(length($asn)) {
+      $clients{$asn}++;
+    } else {
+      print "no match $_\n";
+    }
+    $total++;
+  };
+  if($@) {
+    print("failed $@ with $_\n");
+  }
+}
+
+my(@top) = sort { $clients{$b} <=> $clients{$a} } keys %clients;
+foreach my $client (@top) {
+  if($clients{$client} < 20) {
+    last;
+  }
+  my $asn_name = lookup_asn_name($client);
+  my $pct = int($clients{$client} / $total * 100);
+  print "AS$client ($asn_name):$clients{$client} $pct%\n";
+}
