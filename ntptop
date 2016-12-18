@@ -41,6 +41,7 @@ my $src_ipv4 = "";
 my $src_ipv6 = "";
 my $subnet_report = 0;
 my $asn_index_file;
+my $raw_cutoff;
 my $help = 0;
 GetOptions (
     "interface=s" => \$net_interface,
@@ -49,6 +50,7 @@ GetOptions (
     "ipv6=s"      => \$src_ipv6,
     "subnets"     => \$subnet_report,
     "asns=s"      => \$asn_index_file,
+    "raw=i"       => \$raw_cutoff,
     "help"        => \$help
 ) or die("Error in command line arguments\n");
 # end Configuration
@@ -56,14 +58,18 @@ GetOptions (
 if($help) {
   print "$0: report of NTP clients\n";
   print "  --interface=eth0                   -- which interface to listen on\n";
-  print "  --pcap_filter=\"port 123 and udp\" -- pcap filter to use\n";
+  print "  --filter=\"port 123 and udp\"      -- pcap filter to use\n";
   print "  --ipv4=x.x.x.x                     -- ipv4 source address to filter out (local address)\n";
   print "  --ipv6=x::x                        -- ipv6 source address to filter out (local address)\n";
   print "  --subnets                          -- give a subnet report\n";
   print "  --asns=file                        -- load subnet to ASN index from file\n";
+  print "  --raw=cutoff                       -- only show raw data, excluding any source under [cutoff] packets\n";
   print "  --help                             -- this message\n";
   exit(1);
 }
+
+# turn off buffering
+$| = 1;
 
 my $subnet_to_asn;
 if(defined($asn_index_file)) {
@@ -99,9 +105,69 @@ my(%clients,$packets);
 
 my($last,$client_ts);
 my($last_pkt, $last_clients);
+
+sub raw_report {
+  my($now) = @_;
+
+  if($now-$client_ts > 60) { # every 60 seconds, give a report
+    my(@top) = sort { $clients{$b} <=> $clients{$a} } keys %clients;
+    foreach my $client (@top) {
+      last if($clients{$client} < $raw_cutoff);
+      my $pct = int($clients{$client}/$packets * 100);
+      if(defined($subnet_to_asn)) {
+	if($client =~ /^[0-9]+$/) {
+	  print "$now AS $client $clients{$client} $pct%\n";
+	} else {
+	  print "$now IP $client $clients{$client} $pct%\n";
+	}
+      } else {
+	print "$now IP $client $clients{$client} $pct%\n";
+      }
+    }
+    $client_ts = $now;
+
+    %clients = (); # clear clients every minute
+    $packets = 0;
+  }
+}
+
+sub full_report {
+  my($now) = @_;
+
+  my(@top) = sort { $clients{$b} <=> $clients{$a} } keys %clients;
+  my $pos = 0;
+  for(my $i = 0; $i < 10 and $i < @top and $clients{$top[$i]} > 5; $i++) {
+    my $client = $top[$i];
+    if(defined($subnet_to_asn)) {
+      my $pct = int($clients{$client} / $packets * 100);
+      if($client =~ /^[0-9]+$/) {
+	my $asn_name = lookup_asn_name($client);
+	print "AS$client ($asn_name):$clients{$client} $pct%\n";
+      } else {
+	print "[$client]:$clients{$client} $pct%\n";
+      }
+    } else {
+      my $msg = "[$client]:$clients{$client} ";
+      if($pos + length($msg) > 80) {
+	print "\n";
+	$pos = 0;
+      }
+      print $msg;
+      $pos += length($msg);
+    }
+  }
+  if($pos > 0) {
+    print "\n";
+  }
+}
+
 sub report {
   my $now = time();
   if($now != $last) {
+    if($raw_cutoff) {
+      raw_report($now);
+      return;
+    }
     $last = $now;
     my($clientcount) = scalar(keys %clients);
     if(defined($last_pkt)) {
@@ -112,31 +178,7 @@ sub report {
     $last_pkt = $packets;
     $last_clients = $clientcount;
     if($now-$client_ts > 60) { # every 60 seconds, give a report
-      my(@top) = sort { $clients{$b} <=> $clients{$a} } keys %clients;
-      my $pos = 0;
-      for(my $i = 0; $i < 10 and $i < @top and $clients{$top[$i]} > 5; $i++) {
-	my $client = $top[$i];
-        if(defined($subnet_to_asn)) {
-          my $pct = int($clients{$client} / $packets * 100);
-          if($client =~ /^[0-9]+$/) {
-            my $asn_name = lookup_asn_name($client);
-            print "AS$client ($asn_name):$clients{$client} $pct%\n";
-          } else {
-	    print "[$client]:$clients{$client} $pct%\n";
-	  }
-        } else {
-	  my $msg = "[$client]:$clients{$client} ";
-	  if($pos + length($msg) > 80) {
-	    print "\n";
-	    $pos = 0;
-	  }
-	  print $msg;
-	  $pos += length($msg);
-	}
-      }
-      if($pos > 0) {
-	print "\n";
-      }
+      full_report($now);
       $client_ts = $now;
 
       %clients = (); # clear clients every minute
